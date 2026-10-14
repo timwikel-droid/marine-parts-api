@@ -1,7 +1,10 @@
 """API tests. Each test gets its own fresh temporary database."""
 import pytest
 from fastapi.testclient import TestClient
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
+import pytest
 from app.database import get_connection, init_db
 from app.main import app, get_db
 
@@ -87,7 +90,38 @@ def test_stock_cannot_go_negative(client):
     res = client.post(f"/parts/{part_id}/stock", json={"change": -10})
     assert res.status_code == 400
     assert client.get(f"/parts/{part_id}").json()["quantity_on_hand"] == 5  # unchanged
+    
+def test_stock_can_be_removed_down_to_exactly_zero(client):
+    part_id = client.post("/parts", json=PUMP).json()["id"]  # starts at 5
+    res = client.post(f"/parts/{part_id}/stock", json={"change": -5})
+    assert res.status_code == 200
+    assert res.json()["quantity_on_hand"] == 0
+    # one more removal must now be rejected
+    assert client.post(f"/parts/{part_id}/stock", json={"change": -1}).status_code == 400
 
+
+def test_stock_adjustment_on_missing_part_returns_404(client):
+    assert client.post("/parts/999/stock", json={"change": 1}).status_code == 404
+
+
+def test_concurrent_removals_never_oversell(client):
+    """Fire many simultaneous -1 requests at a part with limited stock.
+    Exactly `stock` of them may succeed; the rest must be rejected."""
+    stock, attempts = 10, 20
+    part_id = client.post("/parts", json={**PUMP, "quantity_on_hand": stock}).json()["id"]
+    barrier = threading.Barrier(attempts)
+
+    def remove_one(_):
+        own_client = TestClient(app)  # one client per thread; the DB override on `app` still applies
+        barrier.wait(timeout=10)      # hold every thread here, then release them all at once
+        return own_client.post(f"/parts/{part_id}/stock", json={"change": -1}).status_code
+
+    with ThreadPoolExecutor(max_workers=attempts) as pool:
+        codes = list(pool.map(remove_one, range(attempts)))
+
+    assert codes.count(200) == stock
+    assert codes.count(400) == attempts - stock
+    assert client.get(f"/parts/{part_id}").json()["quantity_on_hand"] == 0
 
 def test_low_stock_sorted_by_lead_time(client):
     client.post("/parts", json={**PUMP, "part_number": "A", "quantity_on_hand": 1, "lead_time_days": 5})
