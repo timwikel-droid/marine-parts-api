@@ -117,14 +117,21 @@ def update_part(part_id: int, changes: PartUpdate, db: sqlite3.Connection = Depe
 @app.post("/parts/{part_id}/stock", response_model=Part)
 def adjust_stock(part_id: int, adj: StockAdjustment, db: sqlite3.Connection = Depends(get_db)):
     """Record parts arriving (+) or being used (-). Stock can never go below zero."""
-    part = fetch_part_or_404(db, part_id)
-    new_qty = part["quantity_on_hand"] + adj.change
-    if new_qty < 0:
+    # One atomic statement: the check and the write happen together inside SQLite,
+    # so no other request can slip in between them.
+    cur = db.execute(
+        """UPDATE parts
+           SET quantity_on_hand = quantity_on_hand + ?
+           WHERE id = ? AND quantity_on_hand + ? >= 0""",
+        (adj.change, part_id, adj.change),
+    )
+    if cur.rowcount == 0:
+        # Nothing was updated: either the part doesn't exist, or stock would go negative.
+        part = fetch_part_or_404(db, part_id)  # raises 404 if the part is missing
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             detail=f"Only {part['quantity_on_hand']} in stock; cannot remove {-adj.change}",
         )
-    db.execute("UPDATE parts SET quantity_on_hand = ? WHERE id = ?", (new_qty, part_id))
     db.commit()
     return dict(fetch_part_or_404(db, part_id))
 
