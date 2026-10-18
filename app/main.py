@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, HTTPException, Query, Response, status
 
 from app.database import get_connection, init_db
-from app.schemas import Part, PartCreate, PartUpdate, StockAdjustment
+from app.schemas import Part, PartCreate, PartUpdate, StockAdjustment, StockMovement
 
 
 @asynccontextmanager
@@ -117,28 +117,58 @@ def update_part(part_id: int, changes: PartUpdate, db: sqlite3.Connection = Depe
 @app.post("/parts/{part_id}/stock", response_model=Part)
 def adjust_stock(part_id: int, adj: StockAdjustment, db: sqlite3.Connection = Depends(get_db)):
     """Record parts arriving (+) or being used (-). Stock can never go below zero."""
-    # One atomic statement: the check and the write happen together inside SQLite,
-    # so no other request can slip in between them.
-    cur = db.execute(
-        """UPDATE parts
-           SET quantity_on_hand = quantity_on_hand + ?
-           WHERE id = ? AND quantity_on_hand + ? >= 0""",
-        (adj.change, part_id, adj.change),
-    )
-    if cur.rowcount == 0:
-        # Nothing was updated: either the part doesn't exist, or stock would go negative.
-        part = fetch_part_or_404(db, part_id)  # raises 404 if the part is missing
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST,
-            detail=f"Only {part['quantity_on_hand']} in stock; cannot remove {-adj.change}",
+    try:
+        cur = db.execute(
+            """UPDATE parts
+               SET quantity_on_hand = quantity_on_hand + ?
+               WHERE id = ? AND quantity_on_hand + ? >= 0""",
+            (adj.change, part_id, adj.change),
         )
-    db.commit()
+        if cur.rowcount == 0:
+            # Nothing updated: the part is missing, or stock would go negative.
+            part = fetch_part_or_404(db, part_id)  # raises 404 if the part is missing
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                detail=f"Only {part['quantity_on_hand']} in stock; cannot remove {-adj.change}",
+            )
+        db.execute(
+            "INSERT INTO stock_movements (part_id, change, reason) VALUES (?, ?, ?)",
+            (part_id, adj.change, adj.reason),
+        )
+        db.commit()  # one commit: the stock change and its history row land together
+    except sqlite3.Error:
+        db.rollback()  # if anything in SQLite failed, undo the UPDATE too
+        raise
     return dict(fetch_part_or_404(db, part_id))
+
+@app.get("/parts/{part_id}/movements", response_model=list[StockMovement])
+def list_movements(
+    part_id: int,
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    db: sqlite3.Connection = Depends(get_db),
+):
+    """Stock history for one part, newest first."""
+    fetch_part_or_404(db, part_id)
+    rows = db.execute(
+        """SELECT * FROM stock_movements
+           WHERE part_id = ?
+           ORDER BY id DESC LIMIT ? OFFSET ?""",
+        (part_id, limit, offset),
+    ).fetchall()
+    return [dict(r) for r in rows]
 
 
 @app.delete("/parts/{part_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_part(part_id: int, db: sqlite3.Connection = Depends(get_db)):
     fetch_part_or_404(db, part_id)
-    db.execute("DELETE FROM parts WHERE id = ?", (part_id,))
-    db.commit()
+    try:
+        db.execute("DELETE FROM parts WHERE id = ?", (part_id,))
+        db.commit()
+    except sqlite3.IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="Part has stock history and cannot be deleted",
+        )
     return Response(status_code=status.HTTP_204_NO_CONTENT)

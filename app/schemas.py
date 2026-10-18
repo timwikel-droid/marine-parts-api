@@ -1,5 +1,5 @@
 """Pydantic models: they describe and validate the JSON going in and out of the API."""
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class PartBase(BaseModel):
@@ -34,3 +34,17 @@ class Part(PartBase):
 class StockAdjustment(BaseModel):
     change: int = Field(description="Positive when parts arrive, negative when parts are used")
     reason: str | None = Field(default=None, max_length=200, examples=["Used in work order WO-1182"])
+
+    @field_validator("change")
+    @classmethod
+    def change_must_not_be_zero(cls, value: int) -> int:
+        if value == 0:
+            raise ValueError("change must not be 0")
+        return value
+
+class StockMovement(BaseModel):
+    id: int
+    part_id: int
+    change: int
+    reason: str | None
+    created_at: str
