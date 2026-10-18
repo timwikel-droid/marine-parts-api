@@ -135,3 +135,58 @@ def test_delete_part(client):
     part_id = client.post("/parts", json=PUMP).json()["id"]
     assert client.delete(f"/parts/{part_id}").status_code == 204
     assert client.get(f"/parts/{part_id}").status_code == 404
+def _make_part(client, **overrides):
+    body = {"part_number": "PMP-1", "name": "Impeller", "category": "Pumps",
+            "quantity_on_hand": 10}
+    body.update(overrides)
+    r = client.post("/parts", json=body)
+    assert r.status_code == 201
+    return r.json()
+
+
+def test_adjustment_records_movement(client):
+    part = _make_part(client)
+    r = client.post(f"/parts/{part['id']}/stock", json={"change": -3, "reason": "WO-1182"})
+    assert r.status_code == 200
+    assert r.json()["quantity_on_hand"] == 7
+
+    history = client.get(f"/parts/{part['id']}/movements").json()
+    assert len(history) == 1
+    assert history[0]["part_id"] == part["id"]
+    assert history[0]["change"] == -3
+    assert history[0]["reason"] == "WO-1182"
+    assert history[0]["created_at"]
+
+
+def test_movements_are_newest_first(client):
+    part = _make_part(client)
+    client.post(f"/parts/{part['id']}/stock", json={"change": 5, "reason": "delivery"})
+    client.post(f"/parts/{part['id']}/stock", json={"change": -2, "reason": "used"})
+    history = client.get(f"/parts/{part['id']}/movements").json()
+    assert [m["change"] for m in history] == [-2, 5]
+
+
+def test_rejected_adjustment_writes_no_movement(client):
+    part = _make_part(client, quantity_on_hand=2)
+    r = client.post(f"/parts/{part['id']}/stock", json={"change": -5})
+    assert r.status_code == 400
+    assert client.get(f"/parts/{part['id']}/movements").json() == []
+    assert client.get(f"/parts/{part['id']}").json()["quantity_on_hand"] == 2
+
+
+def test_zero_change_is_rejected(client):
+    part = _make_part(client)
+    r = client.post(f"/parts/{part['id']}/stock", json={"change": 0})
+    assert r.status_code == 422
+    assert client.get(f"/parts/{part['id']}/movements").json() == []
+
+
+def test_movements_for_missing_part_returns_404(client):
+    assert client.get("/parts/9999/movements").status_code == 404
+
+
+def test_delete_part_with_history_returns_409(client):
+    part = _make_part(client)
+    client.post(f"/parts/{part['id']}/stock", json={"change": 1})
+    assert client.delete(f"/parts/{part['id']}").status_code == 409
+    assert client.get(f"/parts/{part['id']}").status_code == 200

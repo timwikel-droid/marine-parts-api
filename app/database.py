@@ -16,6 +16,15 @@ CREATE TABLE IF NOT EXISTS parts (
     supplier         TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_parts_category ON parts (category);
+
+CREATE TABLE IF NOT EXISTS stock_movements (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    part_id    INTEGER NOT NULL REFERENCES parts (id),
+    change     INTEGER NOT NULL,
+    reason     TEXT,
+    created_at TEXT    NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_stock_movements_part ON stock_movements (part_id, id);
 """
 
 
@@ -24,6 +33,7 @@ def get_connection(db_path: Path | str = DB_PATH) -> sqlite3.Connection:
     # from a different worker thread than the one that opened it.
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row  # lets us read rows like dicts
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
